@@ -4,6 +4,8 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+import hashlib
+import json
 import os.path
 import subprocess
 from decisionlib import DecisionTask
@@ -16,6 +18,7 @@ def main():
         linux_tidy_unit()
         #linux_wpt()
         android_arm32()
+        windows_dev()
 
     # https://tools.taskcluster.net/hooks/project-servo/daily
     elif task_for == "daily":
@@ -29,6 +32,7 @@ def main():
 
 ping_on_daily_task_failure = "SimonSapin, nox, emilio"
 build_artifacts_expiry = "1 week"
+build_dependencies_artifacts_expiry = "1 month"
 log_artifacts_expiry = "1 year"
 
 build_env = {
@@ -36,10 +40,12 @@ build_env = {
     "RUSTFLAGS": "-Dwarnings",
     "CARGO_INCREMENTAL": "0",
     "SCCACHE_IDLE_TIMEOUT": "1200",
+}
+linux_build_env = dict(**build_env, **{
     "CCACHE": "sccache",
     "RUSTC_WRAPPER": "sccache",
     "SHELL": "/bin/dash",  # For SpiderMonkey’s build system
-}
+})
 
 
 def linux_tidy_unit():
@@ -56,7 +62,7 @@ def linux_tidy_unit():
             ./etc/ci/lockfile_changed.sh
             ./etc/ci/check_no_panic.sh
         """,
-        **build_kwargs
+        **linux_build_kwargs
     )
 
 
@@ -68,7 +74,7 @@ def with_rust_nightly():
             ./mach build --dev
             ./mach test-unit
         """,
-        **build_kwargs
+        **linux_build_kwargs
     )
 
 
@@ -90,7 +96,141 @@ def android_arm32():
             "/repo/target/armv7-linux-androideabi/release/servoapp.apk",
             "/repo/target/armv7-linux-androideabi/release/servoview.aar",
         ],
-        **build_kwargs
+        **linux_build_kwargs
+    )
+
+
+def windows_dev():
+    python2_task = repack_msi(
+        url="https://www.python.org/ftp/python/2.7.15/python-2.7.15.amd64.msi",
+        sha256="5e85f3c4c209de98480acbf2ba2e71a907fd5567a838ad4b6748c76deb286ad7",
+    )
+    gstreamer_task = repack_msi(
+        url="https://gstreamer.freedesktop.org/data/pkg/windows/" +
+            "1.14.3/gstreamer-1.0-devel-x86_64-1.14.3.msi",
+        sha256="b13ea68c1365098c66871f0acab7fd3daa2f2795b5e893fcbb5cd7253f2c08fa",
+    )
+    return decision.create_task(
+        task_name="Windows x86_64: dev build + unit tests",
+        script="""
+            python -m ensurepip
+            pip install virtualenv==16.0.0
+
+            ..\\rustup-init.exe --default-toolchain none -y
+
+            set LIB=%HOMEDRIVE%%HOMEPATH%\\gst\\gstreamer\\1.0\\x86_64\\lib;%LIB%
+
+            call mach.bat build --dev
+            call mach.bat test-unit
+        """,
+        mounts=[
+            {
+                "directory": "git",
+                "format": "zip",
+                "content": {
+                    "url": "https://github.com/git-for-windows/git/releases/download/" +
+                           "v2.19.0.windows.1/MinGit-2.19.0-64-bit.zip",
+                    "sha256": "424d24b5fc185a9c5488d7872262464f2facab4f1d4693ea8008196f14a3c19b",
+                }
+            },
+            {
+                "directory": "python2",
+                "format": "zip",
+                "content": {
+                    "taskId": python2_task,
+                    "artifact": "public/repacked.zip",
+                }
+            },
+            {
+                "directory": "gst",
+                "format": "zip",
+                "content": {
+                    "taskId": gstreamer_task,
+                    "artifact": "public/repacked.zip",
+                }
+            },
+            {
+                "file": "rustup-init.exe",
+                "content": {
+                    "url": "https://static.rust-lang.org/rustup/archive/" +
+                           "1.13.0/i686-pc-windows-gnu/rustup-init.exe",
+                    "sha256": "43072fbe6b38ab38cd872fa51a33ebd781f83a2d5e83013857fab31fc06e4bf0",
+                }
+            }
+        ],
+        homedir_path=[
+            "git\\cmd",
+            "python2",
+            "python2\\Scripts",
+            ".cargo\\bin",
+        ],
+        dependencies=[
+            python2_task,
+            gstreamer_task,
+        ],
+        sparse_checkout=[
+            "/*",
+            "!/tests/wpt/metadata",
+            "!/tests/wpt/mozilla",
+            "!/tests/wpt/webgl",
+            "!/tests/wpt/web-platform-tests",
+            "/tests/wpt/web-platform-tests/tools",
+        ],
+        **windows_build_kwargs
+    )
+
+
+def repack_msi(url, sha256):
+    task_definition = dict(
+        task_name="Windows x86_64: repackage " + url.rpartition("/")[-1],
+        worker_type="servo-win2016",
+        with_repo=False,
+        script="""
+            lessmsi x input.msi extracted\\
+            cd extracted\\SourceDir
+            7za a repacked.zip *
+        """,
+        mounts=[
+            {
+                "file": "input.msi",
+                "content": {
+                    "url": url,
+                    "sha256": sha256,
+                }
+            },
+            {
+                "directory": "lessmsi",
+                "format": "zip",
+                "content": {
+                    "url": "https://github.com/activescott/lessmsi/releases/download/" +
+                           "v1.6.1/lessmsi-v1.6.1.zip",
+                    "sha256": "540b8801e08ec39ba26a100c855898f455410cecbae4991afae7bb2b4df026c7",
+                }
+            },
+            {
+                "directory": "7zip",
+                "format": "zip",
+                "content": {
+                    "url": "https://www.7-zip.org/a/7za920.zip",
+                    "sha256": "2a3afe19c180f8373fa02ff00254d5394fec0349f5804e0ad2f6067854ff28ac",
+                }
+            }
+        ],
+        homedir_path=[
+            "lessmsi",
+            "7zip",
+        ],
+        artifacts=[
+            "extracted/SourceDir/repacked.zip",
+        ],
+        max_run_time_minutes=20,
+    )
+    index_by = json.dumps(task_definition).encode("utf-8")
+    return decision.find_or_create_task(
+        index_bucket="by-task-definition",
+        index_key=hashlib.sha256(index_by).hexdigest(),
+        index_expiry=build_artifacts_expiry,
+        **task_definition
     )
 
 
@@ -120,7 +260,7 @@ def linux_release_build():
         artifacts=[
             "/target.tar.gz",
         ],
-        **build_kwargs
+        **linux_build_kwargs
     )
 
 
@@ -219,11 +359,13 @@ def dockerfile_path(name):
 decision = DecisionTask(
     task_name_template="Servo: %s",
     index_prefix="project.servo.servo",
-    worker_type="servo-docker-worker",
+    default_worker_type="servo-docker-worker",
+    docker_image_cache_expiry=build_dependencies_artifacts_expiry,
 )
 
 # https://docs.taskcluster.net/docs/reference/workers/docker-worker/docs/caches
 cache_scopes = [
+    # FIMXE: move to servo-* cache names
     "docker-worker:cache:cargo-*",
 ]
 build_caches = {
@@ -234,11 +376,18 @@ build_caches = {
 }
 build_kwargs = {
     "max_run_time_minutes": 60,
+}
+linux_build_kwargs = dict(**build_kwargs, **{
+    "worker_type": "servo-docker-worker",
     "dockerfile": dockerfile_path("build"),
-    "env": build_env,
     "scopes": cache_scopes,
     "cache": build_caches,
-}
+    "env": linux_build_env,
+})
+windows_build_kwargs = dict(**build_kwargs, **{
+    "worker_type": "servo-win2016",
+    "env": build_env,
+})
 
 
 if __name__ == "__main__":
